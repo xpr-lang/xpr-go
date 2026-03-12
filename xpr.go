@@ -1,22 +1,77 @@
 package xpr
 
-import "errors"
+import (
+	"fmt"
+	"time"
+)
 
-// ErrNotImplemented is returned by all methods until the XPR Go runtime is implemented.
-var ErrNotImplemented = errors.New("XPR Go runtime not yet implemented")
-
-// Xpr is the XPR expression language engine.
-type Xpr struct{}
-
-// New creates a new Xpr engine instance.
-func New() *Xpr { return &Xpr{} }
-
-// Evaluate evaluates an XPR expression with the given context.
-func (x *Xpr) Evaluate(expression string, context map[string]any) (any, error) {
-	return nil, ErrNotImplemented
+type Xpr struct {
+	fns map[string]xprFunc
 }
 
-// AddFunction registers a custom function for use in expressions.
+func New() *Xpr {
+	return &Xpr{fns: map[string]xprFunc{}}
+}
+
+func normalizeCtxValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch val := v.(type) {
+	case int:
+		return float64(val)
+	case int64:
+		return float64(val)
+	case int32:
+		return float64(val)
+	case uint64:
+		return float64(val)
+	case uint32:
+		return float64(val)
+	case map[string]interface{}:
+		m := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			m[k] = normalizeCtxValue(vv)
+		}
+		return m
+	case map[interface{}]interface{}:
+		m := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			m[fmt.Sprintf("%v", k)] = normalizeCtxValue(vv)
+		}
+		return m
+	case []interface{}:
+		arr := make([]interface{}, len(val))
+		for i, vv := range val {
+			arr[i] = normalizeCtxValue(vv)
+		}
+		return arr
+	}
+	return v
+}
+
+func (x *Xpr) Evaluate(expression string, context map[string]any) (any, error) {
+	tokens, err := tokenize(expression)
+	if err != nil {
+		return nil, err
+	}
+	ast, err := parseTokens(tokens)
+	if err != nil {
+		return nil, err
+	}
+	vars := map[string]interface{}{}
+	for k, v := range context {
+		vars[k] = normalizeCtxValue(v)
+	}
+	ec := &evalCtx{
+		vars:      vars,
+		fns:       x.fns,
+		depth:     0,
+		startTime: time.Now(),
+	}
+	return evalNode(ast, ec)
+}
+
 func (x *Xpr) AddFunction(name string, fn func(...any) (any, error)) {
-	// Not yet implemented
+	x.fns[name] = xprFunc(fn)
 }
