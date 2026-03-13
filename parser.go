@@ -198,14 +198,48 @@ func (p *parser) nud(t token) (*node, error) {
 		}
 		return first, nil
 
+	case tokLet:
+		nameTok, err := p.expect(tokIdentifier)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tokEqual); err != nil {
+			return nil, err
+		}
+		value, err := p.expression(0)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tokSemicolon); err != nil {
+			return nil, err
+		}
+		if p.peek().typ == tokEOF {
+			return nil, fmt.Errorf("expected expression after ';'")
+		}
+		body, err := p.expression(0)
+		if err != nil {
+			return nil, err
+		}
+		return &node{typ: nodeLetExpression, strVal: nameTok.value, children: []*node{value, body}, position: pos}, nil
+
 	case tokLeftBracket:
 		elements := []*node{}
 		for p.peek().typ != tokRightBracket && p.peek().typ != tokEOF {
-			el, err := p.expression(0)
-			if err != nil {
-				return nil, err
+			if p.peek().typ == tokDotDotDot {
+				spreadPos := p.peek().position
+				p.advance()
+				arg, err := p.expression(0)
+				if err != nil {
+					return nil, err
+				}
+				elements = append(elements, &node{typ: nodeSpreadElement, children: []*node{arg}, position: spreadPos})
+			} else {
+				el, err := p.expression(0)
+				if err != nil {
+					return nil, err
+				}
+				elements = append(elements, el)
 			}
-			elements = append(elements, el)
 			if p.peek().typ == tokComma {
 				p.advance()
 			} else {
@@ -221,22 +255,32 @@ func (p *parser) nud(t token) (*node, error) {
 		keys := []string{}
 		vals := []*node{}
 		for p.peek().typ != tokRightBrace && p.peek().typ != tokEOF {
-			kt := p.peek()
-			var key string
-			if kt.typ == tokIdentifier || kt.typ == tokString {
-				key = p.advance().value
+			if p.peek().typ == tokDotDotDot {
+				p.advance()
+				val, err := p.expression(0)
+				if err != nil {
+					return nil, err
+				}
+				keys = append(keys, "...")
+				vals = append(vals, val)
 			} else {
-				return nil, fmt.Errorf("expected object key at position %d", kt.position)
+				kt := p.peek()
+				var key string
+				if kt.typ == tokIdentifier || kt.typ == tokString {
+					key = p.advance().value
+				} else {
+					return nil, fmt.Errorf("expected object key at position %d", kt.position)
+				}
+				if _, err := p.expect(tokColon); err != nil {
+					return nil, err
+				}
+				val, err := p.expression(0)
+				if err != nil {
+					return nil, err
+				}
+				keys = append(keys, key)
+				vals = append(vals, val)
 			}
-			if _, err := p.expect(tokColon); err != nil {
-				return nil, err
-			}
-			val, err := p.expression(0)
-			if err != nil {
-				return nil, err
-			}
-			keys = append(keys, key)
-			vals = append(vals, val)
 			if p.peek().typ == tokComma {
 				p.advance()
 			} else {

@@ -20,6 +20,7 @@ const (
 	nodeTemplateLiteral
 	nodePipeExpression
 	nodeSpreadElement
+	nodeLetExpression
 )
 
 type node struct {

@@ -139,26 +139,77 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		return nil, nil
 
 	case nodeArrayExpression:
-		arr := make([]interface{}, len(n.children))
-		for i, el := range n.children {
-			v, err := nxt(el)
-			if err != nil {
-				return nil, err
+		result := []interface{}{}
+		for _, el := range n.children {
+			if el.typ == nodeSpreadElement {
+				val, err := nxt(el.children[0])
+				if err != nil {
+					return nil, err
+				}
+				if val == nil {
+					return nil, fmt.Errorf("Cannot spread null")
+				}
+				if _, ok := val.(string); ok {
+					return nil, fmt.Errorf("Cannot spread string into array")
+				}
+				arr, ok := val.([]interface{})
+				if !ok {
+					return nil, fmt.Errorf("Cannot spread non-array into array")
+				}
+				result = append(result, arr...)
+			} else {
+				v, err := nxt(el)
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, v)
 			}
-			arr[i] = v
 		}
-		return arr, nil
+		return result, nil
 
 	case nodeObjectExpression:
 		obj := map[string]interface{}{}
 		for i, key := range n.strSlice {
-			v, err := nxt(n.propVals[i])
-			if err != nil {
-				return nil, err
+			if key == "..." {
+				val, err := nxt(n.propVals[i])
+				if err != nil {
+					return nil, err
+				}
+				if val == nil {
+					return nil, fmt.Errorf("Cannot spread null")
+				}
+				if _, ok := val.([]interface{}); ok {
+					return nil, fmt.Errorf("Cannot spread array into object")
+				}
+				m, ok := val.(map[string]interface{})
+				if !ok {
+					return nil, fmt.Errorf("Cannot spread non-object")
+				}
+				for k, v := range m {
+					obj[k] = v
+				}
+			} else {
+				v, err := nxt(n.propVals[i])
+				if err != nil {
+					return nil, err
+				}
+				obj[key] = v
 			}
-			obj[key] = v
 		}
 		return obj, nil
+
+	case nodeLetExpression:
+		val, err := nxt(n.children[0])
+		if err != nil {
+			return nil, err
+		}
+		childVars := make(map[string]interface{}, len(ec.vars)+1)
+		for k, v := range ec.vars {
+			childVars[k] = v
+		}
+		childVars[n.strVal] = val
+		childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
+		return evalNode(n.children[1], childEc)
 
 	case nodeIdentifier:
 		name := n.strVal
@@ -440,6 +491,11 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 				}
 				args[i] = v
 			}
+			if v, ok := ec.vars[name]; ok {
+				if fn, ok := v.(xprFunc); ok {
+					return fn(args...)
+				}
+			}
 			if fn, ok := globalFunctions[name]; ok {
 				arity, hasArity := globalFunctionArity[name]
 				if hasArity && len(args) != arity {
@@ -545,7 +601,7 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		return sb.String(), nil
 
 	case nodeSpreadElement:
-		return nil, fmt.Errorf("spread operator not supported in v0.1")
+		return nil, fmt.Errorf("spread element used outside array context")
 	}
 
 	return nil, fmt.Errorf("unknown AST node type %d", n.typ)
@@ -690,6 +746,102 @@ func callStringMethod(s, method string, args []interface{}, pos int) (interface{
 			return string(runes[start:end]), nil
 		}
 		return string(runes[start:]), nil
+	case "indexOf":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'indexOf': expected 1, got %d", len(args))
+		}
+		sub, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("type error: indexOf expects string argument")
+		}
+		return float64(strings.Index(s, sub)), nil
+	case "repeat":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'repeat': expected 1, got %d", len(args))
+		}
+		f, ok := numVal(args[0])
+		if !ok || f != math.Trunc(f) || f < 0 {
+			return nil, fmt.Errorf("type error: repeat expects non-negative integer")
+		}
+		return strings.Repeat(s, int(f)), nil
+	case "trimStart":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'trimStart': expected 0, got %d", len(args))
+		}
+		return strings.TrimLeftFunc(s, func(r rune) bool {
+			return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+		}), nil
+	case "trimEnd":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'trimEnd': expected 0, got %d", len(args))
+		}
+		return strings.TrimRightFunc(s, func(r rune) bool {
+			return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+		}), nil
+	case "charAt":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'charAt': expected 1, got %d", len(args))
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: charAt expects number argument")
+		}
+		runes := []rune(s)
+		idx := int(f)
+		if idx < 0 || idx >= len(runes) {
+			return "", nil
+		}
+		return string(runes[idx]), nil
+	case "padStart":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'padStart': expected 1-2, got %d", len(args))
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: padStart expects number argument")
+		}
+		n := int(f)
+		padChar := " "
+		if len(args) == 2 {
+			pc, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("type error: padStart pad character must be string")
+			}
+			if len([]rune(pc)) > 0 {
+				padChar = string([]rune(pc)[0:1])
+			}
+		}
+		runes := []rune(s)
+		if len(runes) >= n {
+			return s, nil
+		}
+		pad := strings.Repeat(padChar, n-len(runes))
+		return pad + s, nil
+	case "padEnd":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'padEnd': expected 1-2, got %d", len(args))
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: padEnd expects number argument")
+		}
+		n := int(f)
+		padChar := " "
+		if len(args) == 2 {
+			pc, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("type error: padEnd pad character must be string")
+			}
+			if len([]rune(pc)) > 0 {
+				padChar = string([]rune(pc)[0:1])
+			}
+		}
+		runes := []rune(s)
+		if len(runes) >= n {
+			return s, nil
+		}
+		pad := strings.Repeat(padChar, n-len(runes))
+		return s + pad, nil
 	}
 	return nil, fmt.Errorf("type error: cannot call method '%s' on string", method)
 }
@@ -882,6 +1034,178 @@ func callArrayMethod(arr []interface{}, method string, args []interface{}, pos i
 			cp[len(arr)-1-i] = v
 		}
 		return cp, nil
+	case "includes":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'includes': expected 1, got %d", len(args))
+		}
+		for _, el := range arr {
+			if xprEqual(el, args[0]) {
+				return true, nil
+			}
+		}
+		return false, nil
+	case "indexOf":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'indexOf': expected 1, got %d", len(args))
+		}
+		for i, el := range arr {
+			if xprEqual(el, args[0]) {
+				return float64(i), nil
+			}
+		}
+		return float64(-1), nil
+	case "slice":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'slice': expected 1-2, got %d", len(args))
+		}
+		startF, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: slice expects number argument")
+		}
+		start := int(startF)
+		if start < 0 {
+			start = 0
+		}
+		if start > len(arr) {
+			return []interface{}{}, nil
+		}
+		if len(args) == 2 {
+			endF, ok := numVal(args[1])
+			if !ok {
+				return nil, fmt.Errorf("type error: slice expects number argument")
+			}
+			end := int(endF)
+			if end > len(arr) {
+				end = len(arr)
+			}
+			if end < start {
+				return []interface{}{}, nil
+			}
+			return arr[start:end], nil
+		}
+		return arr[start:], nil
+	case "join":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'join': expected 1, got %d", len(args))
+		}
+		sep, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("type error: join expects string argument")
+		}
+		parts := make([]string, len(arr))
+		for i, el := range arr {
+			parts[i] = xprToString(el)
+		}
+		return strings.Join(parts, sep), nil
+	case "concat":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'concat': expected 1, got %d", len(args))
+		}
+		other, ok := args[0].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("type error: concat expects array argument")
+		}
+		result := make([]interface{}, len(arr)+len(other))
+		copy(result, arr)
+		copy(result[len(arr):], other)
+		return result, nil
+	case "flat":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'flat': expected 0, got %d", len(args))
+		}
+		result := []interface{}{}
+		for _, el := range arr {
+			if sub, ok := el.([]interface{}); ok {
+				result = append(result, sub...)
+			} else {
+				result = append(result, el)
+			}
+		}
+		return result, nil
+	case "unique":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'unique': expected 0, got %d", len(args))
+		}
+		seen := []interface{}{}
+		result := []interface{}{}
+		for _, el := range arr {
+			found := false
+			for _, s := range seen {
+				if xprEqual(el, s) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				seen = append(seen, el)
+				result = append(result, el)
+			}
+		}
+		return result, nil
+	case "zip":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'zip': expected 1, got %d", len(args))
+		}
+		other, ok := args[0].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("type error: zip expects array argument")
+		}
+		length := len(arr)
+		if len(other) < length {
+			length = len(other)
+		}
+		result := make([]interface{}, length)
+		for i := 0; i < length; i++ {
+			result[i] = []interface{}{arr[i], other[i]}
+		}
+		return result, nil
+	case "chunk":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'chunk': expected 1, got %d", len(args))
+		}
+		f, ok := numVal(args[0])
+		if !ok || f != math.Trunc(f) || f <= 0 {
+			return nil, fmt.Errorf("type error: chunk size must be a positive integer")
+		}
+		size := int(f)
+		result := []interface{}{}
+		for i := 0; i < len(arr); i += size {
+			end := i + size
+			if end > len(arr) {
+				end = len(arr)
+			}
+			chunk := make([]interface{}, end-i)
+			copy(chunk, arr[i:end])
+			result = append(result, chunk)
+		}
+		return result, nil
+	case "groupBy":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'groupBy': expected 1 function, got %d", len(args))
+		}
+		fn, ok := args[0].(xprFunc)
+		if !ok {
+			return nil, fmt.Errorf("wrong number of arguments for 'groupBy': expected 1 function, got %d", len(args))
+		}
+		groups := map[string][]interface{}{}
+		groupKeys := []string{}
+		for _, el := range arr {
+			keyVal, err := fn(el)
+			if err != nil {
+				return nil, err
+			}
+			key := fmt.Sprintf("%v", keyVal)
+			if _, exists := groups[key]; !exists {
+				groupKeys = append(groupKeys, key)
+			}
+			groups[key] = append(groups[key], el)
+		}
+		sort.Strings(groupKeys)
+		result := map[string]interface{}{}
+		for _, k := range groupKeys {
+			result[k] = groups[k]
+		}
+		return result, nil
 	}
 	return nil, fmt.Errorf("type error: cannot call method '%s' on array", method)
 }
@@ -911,6 +1235,30 @@ func callObjectMethod(obj map[string]interface{}, method string, args []interfac
 			vals = append(vals, v)
 		}
 		return vals, nil
+	case "entries":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'entries': expected 0, got %d", len(args))
+		}
+		rawKeys := make([]string, 0, len(obj))
+		for k := range obj {
+			rawKeys = append(rawKeys, k)
+		}
+		sort.Strings(rawKeys)
+		result := make([]interface{}, len(rawKeys))
+		for i, k := range rawKeys {
+			result[i] = []interface{}{k, obj[k]}
+		}
+		return result, nil
+	case "has":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'has': expected 1, got %d", len(args))
+		}
+		key, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("type error: has expects string argument")
+		}
+		_, exists := obj[key]
+		return exists, nil
 	}
 	return nil, fmt.Errorf("type error: cannot call method '%s' on object", method)
 }
@@ -1037,5 +1385,50 @@ var globalFunctions = map[string]xprFunc{
 			return nil, fmt.Errorf("wrong number of arguments for 'bool'")
 		}
 		return isTruthy(args[0]), nil
+	},
+	"range": func(args ...interface{}) (interface{}, error) {
+		var start, end, step float64
+		switch len(args) {
+		case 1:
+			f, ok := numVal(args[0])
+			if !ok {
+				return nil, fmt.Errorf("type error: range expects number arguments")
+			}
+			start, end, step = 0, f, 1
+		case 2:
+			f0, ok0 := numVal(args[0])
+			f1, ok1 := numVal(args[1])
+			if !ok0 || !ok1 {
+				return nil, fmt.Errorf("type error: range expects number arguments")
+			}
+			start, end, step = f0, f1, 1
+		case 3:
+			f0, ok0 := numVal(args[0])
+			f1, ok1 := numVal(args[1])
+			f2, ok2 := numVal(args[2])
+			if !ok0 || !ok1 || !ok2 {
+				return nil, fmt.Errorf("type error: range expects number arguments")
+			}
+			start, end, step = f0, f1, f2
+		default:
+			return nil, fmt.Errorf("wrong number of arguments for 'range': expected 1-3, got %d", len(args))
+		}
+		if step != math.Trunc(step) {
+			return nil, fmt.Errorf("type error: range step must be an integer, got float")
+		}
+		if step == 0 {
+			return nil, fmt.Errorf("type error: range step cannot be zero")
+		}
+		result := []interface{}{}
+		if step > 0 {
+			for i := start; i < end; i += step {
+				result = append(result, i)
+			}
+		} else {
+			for i := start; i > end; i += step {
+				result = append(result, i)
+			}
+		}
+		return result, nil
 	},
 }

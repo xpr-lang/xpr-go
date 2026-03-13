@@ -43,6 +43,10 @@ const (
 	tokRightBracket
 	tokLeftBrace
 	tokRightBrace
+	tokSemicolon
+	tokDotDotDot
+	tokLet
+	tokEqual
 	tokEOF
 )
 
@@ -288,7 +292,17 @@ func tokenize(src string) ([]token, error) {
 				t := token{tokNull, s, start}
 				return &t, nil
 			}
+			if s == "let" {
+				t := token{tokLet, s, start}
+				return &t, nil
+			}
 			t := token{tokIdentifier, s, start}
+			return &t, nil
+		}
+
+		if pos+2 < n && src[pos] == '.' && src[pos+1] == '.' && src[pos+2] == '.' {
+			pos += 3
+			t := token{tokDotDotDot, "...", start}
 			return &t, nil
 		}
 
@@ -382,6 +396,10 @@ func tokenize(src string) ([]token, error) {
 			typ = tokLeftBrace
 		case '}':
 			typ = tokRightBrace
+		case ';':
+			typ = tokSemicolon
+		case '=':
+			typ = tokEqual
 		default:
 			return nil, fmt.Errorf("unexpected character '%c' at position %d", ch, start)
 		}
