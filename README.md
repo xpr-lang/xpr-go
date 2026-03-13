@@ -1,6 +1,8 @@
 # xpr-go — XPR Expression Language for Go
 
 [![CI](https://github.com/xpr-lang/xpr-go/actions/workflows/ci.yml/badge.svg)](https://github.com/xpr-lang/xpr-go/actions/workflows/ci.yml)
+[![XPR spec](https://img.shields.io/badge/XPR_spec-v0.2-blue)](https://github.com/xpr-lang/xpr)
+[![conformance](https://img.shields.io/badge/conformance-100%25-brightgreen)](https://github.com/xpr-lang/xpr/tree/main/conformance)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **XPR** is a sandboxed cross-language expression language for data pipeline transforms. This is the Go reference runtime.
