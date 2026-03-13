@@ -1230,9 +1230,14 @@ func callObjectMethod(obj map[string]interface{}, method string, args []interfac
 		if len(args) != 0 {
 			return nil, fmt.Errorf("wrong number of arguments for 'values': expected 0, got %d", len(args))
 		}
-		vals := make([]interface{}, 0, len(obj))
-		for _, v := range obj {
-			vals = append(vals, v)
+		rawKeys := make([]string, 0, len(obj))
+		for k := range obj {
+			rawKeys = append(rawKeys, k)
+		}
+		sort.Strings(rawKeys)
+		vals := make([]interface{}, len(rawKeys))
+		for i, k := range rawKeys {
+			vals[i] = obj[k]
 		}
 		return vals, nil
 	case "entries":
