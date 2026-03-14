@@ -76,11 +76,22 @@ func (p *parser) expect(typ tokenType) (token, error) {
 func (p *parser) parseArgList() ([]*node, error) {
 	args := []*node{}
 	for p.peek().typ != tokRightParen && p.peek().typ != tokEOF {
-		arg, err := p.expression(0)
-		if err != nil {
-			return nil, err
+		if p.peek().typ == tokDotDotDot {
+			pos := p.peek().position
+			p.advance()
+			arg, err := p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+			spread := &node{typ: nodeSpreadElement, position: pos, children: []*node{arg}}
+			args = append(args, spread)
+		} else {
+			arg, err := p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, arg)
 		}
-		args = append(args, arg)
 		if p.peek().typ == tokComma {
 			p.advance()
 		} else {
