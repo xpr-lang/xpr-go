@@ -4,11 +4,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+func expandArgs(argNodes []*node, nxt func(*node) (interface{}, error)) ([]interface{}, error) {
+	var result []interface{}
+	for _, a := range argNodes {
+		if a.typ == nodeSpreadElement {
+			val, err := nxt(a.children[0])
+			if err != nil {
+				return nil, err
+			}
+			if val == nil {
+				return nil, fmt.Errorf("Cannot spread null")
+			}
+			arr, ok := val.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("Cannot spread non-array")
+			}
+			result = append(result, arr...)
+		} else {
+			val, err := nxt(a)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, val)
+		}
+	}
+	return result, nil
+}
 
 var blockedProps = map[string]bool{
 	"__proto__": true, "constructor": true, "prototype": true,
@@ -247,11 +275,11 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 				if !ok {
 					return nil, fmt.Errorf("cannot index non-array with number")
 				}
-				idx := int(f)
+				idx := int(math.Trunc(f))
 				if idx < 0 {
-					return nil, fmt.Errorf("negative indexing not supported")
+					idx = len(arr) + idx
 				}
-				if idx >= len(arr) {
+				if idx < 0 || idx >= len(arr) {
 					return nil, nil
 				}
 				return arr[idx], nil
@@ -470,26 +498,18 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 			if blockedProps[methodName] {
 				return nil, fmt.Errorf("access denied: '%s' is a restricted property", methodName)
 			}
-			args := make([]interface{}, len(argNodes))
-			for i, a := range argNodes {
-				v, err := nxt(a)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = v
+			args, err := expandArgs(argNodes, nxt)
+			if err != nil {
+				return nil, err
 			}
 			return dispatchMethod(obj, methodName, args, n.position)
 		}
 
 		if callee.typ == nodeIdentifier {
 			name := callee.strVal
-			args := make([]interface{}, len(argNodes))
-			for i, a := range argNodes {
-				v, err := nxt(a)
-				if err != nil {
-					return nil, err
-				}
-				args[i] = v
+			args, err := expandArgs(argNodes, nxt)
+			if err != nil {
+				return nil, err
 			}
 			if v, ok := ec.vars[name]; ok {
 				if fn, ok := v.(xprFunc); ok {
@@ -516,13 +536,9 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		if n.optional && calleeVal == nil {
 			return nil, nil
 		}
-		args := make([]interface{}, len(argNodes))
-		for i, a := range argNodes {
-			v, err := nxt(a)
-			if err != nil {
-				return nil, err
-			}
-			args[i] = v
+		args, err := expandArgs(argNodes, nxt)
+		if err != nil {
+			return nil, err
 		}
 		fn, ok := calleeVal.(xprFunc)
 		if !ok {
@@ -1268,9 +1284,55 @@ func callObjectMethod(obj map[string]interface{}, method string, args []interfac
 	return nil, fmt.Errorf("type error: cannot call method '%s' on object", method)
 }
 
+func icuToGoFormat(icu string) string {
+	result := icu
+	result = strings.ReplaceAll(result, "yyyy", "2006")
+	result = strings.ReplaceAll(result, "MM", "01")
+	result = strings.ReplaceAll(result, "dd", "02")
+	result = strings.ReplaceAll(result, "HH", "15")
+	result = strings.ReplaceAll(result, "mm", "04")
+	result = strings.ReplaceAll(result, "ss", "05")
+	result = strings.ReplaceAll(result, "SSS", "000")
+	return result
+}
+
+func epochMsToTime(args []interface{}, funcName string) (time.Time, error) {
+	if len(args) != 1 {
+		return time.Time{}, fmt.Errorf("wrong number of arguments for '%s': expected 1, got %d", funcName, len(args))
+	}
+	ms, ok := numVal(args[0])
+	if !ok {
+		return time.Time{}, fmt.Errorf("Type error: %s expects number (epoch ms)", funcName)
+	}
+	return time.UnixMilli(int64(ms)).UTC(), nil
+}
+
+func extractInlineFlags(pattern string) (string, string) {
+	re := regexp.MustCompile(`^\(\?([imsu]+)\)(.*)`)
+	m := re.FindStringSubmatch(pattern)
+	if m != nil {
+		return m[2], m[1]
+	}
+	return pattern, ""
+}
+
+func compileWithFlags(pattern string) (*regexp.Regexp, error) {
+	src, flags := extractInlineFlags(pattern)
+	prefix := ""
+	if strings.Contains(flags, "i") {
+		prefix += "(?i)"
+	}
+	if strings.Contains(flags, "m") {
+		prefix += "(?m)"
+	}
+	if strings.Contains(flags, "s") {
+		prefix += "(?s)"
+	}
+	return regexp.Compile(prefix + src)
+}
+
 var globalFunctionArity = map[string]int{
 	"round": 1, "floor": 1, "ceil": 1, "abs": 1,
-	"min": 2, "max": 2,
 	"type": 1, "int": 1, "float": 1, "string": 1, "bool": 1,
 }
 
@@ -1316,26 +1378,38 @@ var globalFunctions = map[string]xprFunc{
 		return math.Abs(f), nil
 	},
 	"min": func(args ...interface{}) (interface{}, error) {
-		if len(args) != 2 {
-			return nil, fmt.Errorf("wrong number of arguments for 'min'")
+		if len(args) < 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'min': expected at least 2, got %d", len(args))
 		}
-		a, aok := numVal(args[0])
-		b, bok := numVal(args[1])
-		if !aok || !bok {
+		result, ok := numVal(args[0])
+		if !ok {
 			return nil, fmt.Errorf("type error: min expects numbers")
 		}
-		return math.Min(a, b), nil
+		for _, a := range args[1:] {
+			f, ok := numVal(a)
+			if !ok {
+				return nil, fmt.Errorf("type error: min expects numbers")
+			}
+			result = math.Min(result, f)
+		}
+		return result, nil
 	},
 	"max": func(args ...interface{}) (interface{}, error) {
-		if len(args) != 2 {
-			return nil, fmt.Errorf("wrong number of arguments for 'max'")
+		if len(args) < 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'max': expected at least 2, got %d", len(args))
 		}
-		a, aok := numVal(args[0])
-		b, bok := numVal(args[1])
-		if !aok || !bok {
+		result, ok := numVal(args[0])
+		if !ok {
 			return nil, fmt.Errorf("type error: max expects numbers")
 		}
-		return math.Max(a, b), nil
+		for _, a := range args[1:] {
+			f, ok := numVal(a)
+			if !ok {
+				return nil, fmt.Errorf("type error: max expects numbers")
+			}
+			result = math.Max(result, f)
+		}
+		return result, nil
 	},
 	"type": func(args ...interface{}) (interface{}, error) {
 		if len(args) != 1 {
@@ -1435,5 +1509,265 @@ var globalFunctions = map[string]xprFunc{
 			}
 		}
 		return result, nil
+	},
+
+	// ── Date/Time Functions (v0.3) ──────────────────────────────────────────
+	"now": func(args ...interface{}) (interface{}, error) {
+		return float64(time.Now().UTC().UnixMilli()), nil
+	},
+	"parseDate": func(args ...interface{}) (interface{}, error) {
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'parseDate': expected 1-2, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: parseDate expects string")
+		}
+		if len(args) == 1 {
+			formats := []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05Z", "2006-01-02T15:04:05", "2006-01-02"}
+			for _, fmt2 := range formats {
+				if t, err := time.ParseInLocation(fmt2, str, time.UTC); err == nil {
+					return float64(t.UnixMilli()), nil
+				}
+			}
+			return nil, fmt.Errorf("invalid date string: %q", str)
+		}
+		fmtStr, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: parseDate format must be string")
+		}
+		goFmt := icuToGoFormat(fmtStr)
+		t, err := time.ParseInLocation(goFmt, str, time.UTC)
+		if err != nil {
+			return nil, fmt.Errorf("invalid date string: %q does not match format %q", str, fmtStr)
+		}
+		return float64(t.UnixMilli()), nil
+	},
+	"formatDate": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'formatDate': expected 2, got %d", len(args))
+		}
+		ms, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: formatDate expects number (epoch ms)")
+		}
+		fmtStr, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: formatDate format must be string")
+		}
+		t := time.UnixMilli(int64(ms)).UTC()
+		return t.Format(icuToGoFormat(fmtStr)), nil
+	},
+	"year": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "year")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Year()), nil
+	},
+	"month": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "month")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Month()), nil
+	},
+	"day": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "day")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Day()), nil
+	},
+	"hour": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "hour")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Hour()), nil
+	},
+	"minute": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "minute")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Minute()), nil
+	},
+	"second": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "second")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Second()), nil
+	},
+	"millisecond": func(args ...interface{}) (interface{}, error) {
+		t, err := epochMsToTime(args, "millisecond")
+		if err != nil {
+			return nil, err
+		}
+		return float64(t.Nanosecond() / 1e6), nil
+	},
+	"dateAdd": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 3 {
+			return nil, fmt.Errorf("wrong number of arguments for 'dateAdd': expected 3, got %d", len(args))
+		}
+		ms, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: dateAdd expects number (epoch ms)")
+		}
+		amount, ok := numVal(args[1])
+		if !ok {
+			return nil, fmt.Errorf("Type error: dateAdd amount must be number")
+		}
+		unit, ok := args[2].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: dateAdd unit must be string")
+		}
+		amt := int(math.Trunc(amount))
+		t := time.UnixMilli(int64(ms)).UTC()
+		switch unit {
+		case "years":
+			t = t.AddDate(amt, 0, 0)
+		case "months":
+			t = t.AddDate(0, amt, 0)
+		case "days":
+			t = t.AddDate(0, 0, amt)
+		case "hours":
+			t = t.Add(time.Duration(amt) * time.Hour)
+		case "minutes":
+			t = t.Add(time.Duration(amt) * time.Minute)
+		case "seconds":
+			t = t.Add(time.Duration(amt) * time.Second)
+		case "milliseconds":
+			return ms + float64(amt), nil
+		default:
+			return nil, fmt.Errorf("invalid unit %q for dateAdd", unit)
+		}
+		return float64(t.UnixMilli()), nil
+	},
+	"dateDiff": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 3 {
+			return nil, fmt.Errorf("wrong number of arguments for 'dateDiff': expected 3, got %d", len(args))
+		}
+		ms1, ok1 := numVal(args[0])
+		ms2, ok2 := numVal(args[1])
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("Type error: dateDiff expects number (epoch ms)")
+		}
+		unit, ok := args[2].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: dateDiff unit must be string")
+		}
+		diffMs := ms2 - ms1
+		switch unit {
+		case "milliseconds":
+			return diffMs, nil
+		case "seconds":
+			return math.Trunc(diffMs / 1000), nil
+		case "minutes":
+			return math.Trunc(diffMs / 60000), nil
+		case "hours":
+			return math.Trunc(diffMs / 3600000), nil
+		case "days":
+			return math.Trunc(diffMs / 86400000), nil
+		case "months":
+			t1 := time.UnixMilli(int64(ms1)).UTC()
+			t2 := time.UnixMilli(int64(ms2)).UTC()
+			return float64((t2.Year()-t1.Year())*12 + int(t2.Month()-t1.Month())), nil
+		case "years":
+			t1 := time.UnixMilli(int64(ms1)).UTC()
+			t2 := time.UnixMilli(int64(ms2)).UTC()
+			return float64(t2.Year() - t1.Year()), nil
+		default:
+			return nil, fmt.Errorf("invalid unit %q for dateDiff", unit)
+		}
+	},
+
+	// ── Regex Functions (v0.3) ────────────────────────────────────────────────
+	"matches": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'matches': expected 2, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: matches expects string")
+		}
+		pattern, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: matches pattern must be string")
+		}
+		re, err := compileWithFlags(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern: %s", err)
+		}
+		return re.MatchString(str), nil
+	},
+	"match": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'match': expected 2, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: match expects string")
+		}
+		pattern, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: match pattern must be string")
+		}
+		re, err := compileWithFlags(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern: %s", err)
+		}
+		loc := re.FindStringIndex(str)
+		if loc == nil {
+			return nil, nil
+		}
+		return str[loc[0]:loc[1]], nil
+	},
+	"matchAll": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'matchAll': expected 2, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: matchAll expects string")
+		}
+		pattern, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: matchAll pattern must be string")
+		}
+		re, err := compileWithFlags(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern: %s", err)
+		}
+		matches := re.FindAllString(str, -1)
+		result := make([]interface{}, len(matches))
+		for i, m := range matches {
+			result[i] = m
+		}
+		return result, nil
+	},
+	"replacePattern": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 3 {
+			return nil, fmt.Errorf("wrong number of arguments for 'replacePattern': expected 3, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: replacePattern expects string")
+		}
+		pattern, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: replacePattern pattern must be string")
+		}
+		replacement, ok := args[2].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: replacePattern replacement must be string")
+		}
+		re, err := compileWithFlags(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern: %s", err)
+		}
+		goRepl := regexp.MustCompile(`\$(\d+)`).ReplaceAllString(replacement, "$${${1}}")
+		return re.ReplaceAllString(str, goRepl), nil
 	},
 }
