@@ -101,6 +101,171 @@ func (p *parser) parseArgList() ([]*node, error) {
 	return args, nil
 }
 
+func (p *parser) parseBindingTarget() (*node, error) {
+	if p.peek().typ == tokLeftBrace {
+		return p.parseObjectPattern()
+	}
+	if p.peek().typ == tokLeftBracket {
+		return p.parseArrayPattern()
+	}
+	t, err := p.expect(tokIdentifier)
+	if err != nil {
+		return nil, err
+	}
+	return &node{typ: nodeIdentifier, strVal: t.value, position: t.position}, nil
+}
+
+func (p *parser) parseObjectPattern() (*node, error) {
+	pos := p.peek().position
+	if _, err := p.expect(tokLeftBrace); err != nil {
+		return nil, err
+	}
+	n := &node{typ: nodeObjectPattern, position: pos}
+	seen := map[string]bool{}
+	for p.peek().typ != tokRightBrace && p.peek().typ != tokEOF {
+		// rest: {...rest}
+		if p.peek().typ == tokDotDotDot {
+			p.advance()
+			idTok, err := p.expect(tokIdentifier)
+			if err != nil {
+				return nil, err
+			}
+			restNode := &node{typ: nodeIdentifier, strVal: idTok.value, position: idTok.position}
+			n.strSlice = append(n.strSlice, idTok.value)
+			n.propVals = append(n.propVals, restNode)
+			n.boolSlice = append(n.boolSlice, true) // rest=true
+			n.defaultVals = append(n.defaultVals, nil)
+			break
+		}
+		var key string
+		kt := p.peek()
+		if kt.typ == tokIdentifier || kt.typ == tokString {
+			key = p.advance().value
+		} else {
+			return nil, fmt.Errorf("expected property key at position %d", kt.position)
+		}
+		if p.peek().typ == tokColon {
+			// rename: {key: target} or nested: {key: {nested}}
+			p.advance()
+			val, err := p.parseBindingTarget()
+			if err != nil {
+				return nil, err
+			}
+			var def *node
+			if p.peek().typ == tokEqual {
+				p.advance()
+				def, err = p.expression(0)
+				if err != nil {
+					return nil, err
+				}
+			}
+			n.strSlice = append(n.strSlice, key)
+			n.propVals = append(n.propVals, val)
+			n.boolSlice = append(n.boolSlice, false)
+			n.defaultVals = append(n.defaultVals, def)
+		} else if p.peek().typ == tokEqual {
+			// shorthand with default: {key = default}
+			p.advance()
+			def, err := p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate binding '%s'", key)
+			}
+			seen[key] = true
+			idNode := &node{typ: nodeIdentifier, strVal: key, position: kt.position}
+			n.strSlice = append(n.strSlice, key)
+			n.propVals = append(n.propVals, idNode)
+			n.boolSlice = append(n.boolSlice, false)
+			n.defaultVals = append(n.defaultVals, def)
+		} else {
+			// shorthand: {key}
+			if seen[key] {
+				return nil, fmt.Errorf("duplicate binding '%s'", key)
+			}
+			seen[key] = true
+			idNode := &node{typ: nodeIdentifier, strVal: key, position: kt.position}
+			n.strSlice = append(n.strSlice, key)
+			n.propVals = append(n.propVals, idNode)
+			n.boolSlice = append(n.boolSlice, false)
+			n.defaultVals = append(n.defaultVals, nil)
+		}
+		if p.peek().typ == tokComma {
+			p.advance()
+		} else {
+			break
+		}
+	}
+	if _, err := p.expect(tokRightBrace); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (p *parser) parseArrayPattern() (*node, error) {
+	pos := p.peek().position
+	if _, err := p.expect(tokLeftBracket); err != nil {
+		return nil, err
+	}
+	n := &node{typ: nodeArrayPattern, position: pos}
+	for p.peek().typ != tokRightBracket && p.peek().typ != tokEOF {
+		if p.peek().typ == tokDotDotDot {
+			p.advance()
+			idTok, err := p.expect(tokIdentifier)
+			if err != nil {
+				return nil, err
+			}
+			restNode := &node{typ: nodeIdentifier, strVal: idTok.value, position: idTok.position}
+			n.children = append(n.children, restNode)
+			n.boolSlice = append(n.boolSlice, true) // rest=true
+			n.defaultVals = append(n.defaultVals, nil)
+			break
+		}
+		el, err := p.parseBindingTarget()
+		if err != nil {
+			return nil, err
+		}
+		var def *node
+		if p.peek().typ == tokEqual {
+			p.advance()
+			def, err = p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+		}
+		n.children = append(n.children, el)
+		n.boolSlice = append(n.boolSlice, false)
+		n.defaultVals = append(n.defaultVals, def)
+		if p.peek().typ == tokComma {
+			p.advance()
+		} else {
+			break
+		}
+	}
+	if _, err := p.expect(tokRightBracket); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (p *parser) parseArrowParamList() ([]*node, error) {
+	var params []*node
+	for p.peek().typ != tokRightParen && p.peek().typ != tokEOF {
+		pn, err := p.parseBindingTarget()
+		if err != nil {
+			return nil, err
+		}
+		params = append(params, pn)
+		if p.peek().typ == tokComma {
+			p.advance()
+		} else {
+			break
+		}
+	}
+	return params, nil
+}
+
 func (p *parser) nud(t token) (*node, error) {
 	pos := t.position
 
@@ -118,6 +283,18 @@ func (p *parser) nud(t token) (*node, error) {
 
 	case tokNull:
 		return &node{typ: nodeNullLiteral, position: pos}, nil
+
+	case tokRegex:
+		slashIdx := len(t.value) - 1
+		for i := len(t.value) - 1; i >= 0; i-- {
+			if t.value[i] == '/' {
+				slashIdx = i
+				break
+			}
+		}
+		pattern := t.value[:slashIdx]
+		flags := t.value[slashIdx+1:]
+		return &node{typ: nodeRegexLiteral, strVal: pattern, strSlice: []string{flags}, position: pos}, nil
 
 	case tokTemplateLiteral:
 		n := &node{typ: nodeTemplateLiteral, strSlice: []string{t.value}, children: []*node{}, position: pos}
@@ -167,22 +344,10 @@ func (p *parser) nud(t token) (*node, error) {
 			}
 			return &node{typ: nodeArrowFunction, strSlice: []string{}, children: []*node{body}, position: pos}, nil
 		}
-		first, err := p.expression(0)
-		if err != nil {
-			return nil, err
-		}
-		if p.peek().typ == tokComma {
-			if first.typ != nodeIdentifier {
-				return nil, fmt.Errorf("arrow function params must be identifiers at position %d", pos)
-			}
-			params := []string{first.strVal}
-			for p.peek().typ == tokComma {
-				p.advance()
-				pt, err := p.expect(tokIdentifier)
-				if err != nil {
-					return nil, err
-				}
-				params = append(params, pt.value)
+		if p.peek().typ == tokLeftBrace || p.peek().typ == tokLeftBracket {
+			paramNodes, err := p.parseArrowParamList()
+			if err != nil {
+				return nil, err
 			}
 			if _, err := p.expect(tokRightParen); err != nil {
 				return nil, err
@@ -194,7 +359,50 @@ func (p *parser) nud(t token) (*node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &node{typ: nodeArrowFunction, strSlice: params, children: []*node{body}, position: pos}, nil
+			return &node{typ: nodeArrowFunction, children: append(paramNodes, body), position: pos}, nil
+		}
+		first, err := p.expression(0)
+		if err != nil {
+			return nil, err
+		}
+		if p.peek().typ == tokComma {
+			if first.typ != nodeIdentifier {
+				return nil, fmt.Errorf("arrow function params must be identifiers at position %d", pos)
+			}
+			paramNodes := []*node{first}
+			for p.peek().typ == tokComma {
+				p.advance()
+				if p.peek().typ == tokLeftBrace {
+					pn, err := p.parseObjectPattern()
+					if err != nil {
+						return nil, err
+					}
+					paramNodes = append(paramNodes, pn)
+				} else if p.peek().typ == tokLeftBracket {
+					pn, err := p.parseArrayPattern()
+					if err != nil {
+						return nil, err
+					}
+					paramNodes = append(paramNodes, pn)
+				} else {
+					pt, err := p.expect(tokIdentifier)
+					if err != nil {
+						return nil, err
+					}
+					paramNodes = append(paramNodes, &node{typ: nodeIdentifier, strVal: pt.value, position: pt.position})
+				}
+			}
+			if _, err := p.expect(tokRightParen); err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokArrow); err != nil {
+				return nil, err
+			}
+			body, err := p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+			return &node{typ: nodeArrowFunction, children: append(paramNodes, body), position: pos}, nil
 		}
 		if _, err := p.expect(tokRightParen); err != nil {
 			return nil, err
@@ -210,9 +418,25 @@ func (p *parser) nud(t token) (*node, error) {
 		return first, nil
 
 	case tokLet:
-		nameTok, err := p.expect(tokIdentifier)
-		if err != nil {
-			return nil, err
+		var nameNode *node
+		if p.peek().typ == tokLeftBrace {
+			n, err := p.parseObjectPattern()
+			if err != nil {
+				return nil, err
+			}
+			nameNode = n
+		} else if p.peek().typ == tokLeftBracket {
+			n, err := p.parseArrayPattern()
+			if err != nil {
+				return nil, err
+			}
+			nameNode = n
+		} else {
+			nameTok, err := p.expect(tokIdentifier)
+			if err != nil {
+				return nil, err
+			}
+			nameNode = &node{typ: nodeIdentifier, strVal: nameTok.value, position: nameTok.position}
 		}
 		if _, err := p.expect(tokEqual); err != nil {
 			return nil, err
@@ -231,7 +455,7 @@ func (p *parser) nud(t token) (*node, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &node{typ: nodeLetExpression, strVal: nameTok.value, children: []*node{value, body}, position: pos}, nil
+		return &node{typ: nodeLetExpression, children: []*node{nameNode, value, body}, position: pos}, nil
 
 	case tokLeftBracket:
 		elements := []*node{}

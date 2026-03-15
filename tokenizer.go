@@ -47,6 +47,7 @@ const (
 	tokDotDotDot
 	tokLet
 	tokEqual
+	tokRegex
 	tokEOF
 )
 
@@ -77,10 +78,22 @@ func processEscape(ch byte) string {
 	}
 }
 
+var regexAfterTokens = map[tokenType]bool{
+	tokEqual: true, tokEqualEqual: true, tokBangEqual: true,
+	tokLeftParen: true, tokLeftBracket: true, tokLeftBrace: true,
+	tokComma: true, tokSemicolon: true, tokQuestion: true, tokColon: true,
+	tokPipeGreater: true, tokArrow: true, tokAmpAmp: true, tokPipePipe: true,
+	tokQuestionQuestion: true, tokBang: true, tokPlus: true, tokMinus: true,
+	tokStar: true, tokSlash: true, tokPercent: true, tokStarStar: true,
+	tokLess: true, tokGreater: true, tokLessEqual: true, tokGreaterEqual: true,
+	tokDotDotDot: true, tokLet: true,
+}
+
 func tokenize(src string) ([]token, error) {
 	tokens := []token{}
 	pos := 0
 	n := len(src)
+	var lastType tokenType = -1
 
 	peek := func(offset int) byte {
 		idx := pos + offset
@@ -158,7 +171,9 @@ func tokenize(src string) ([]token, error) {
 			if ch == '{' {
 				depth++
 				advance()
-				seg = append(seg, token{tokLeftBrace, "{", pos - 1})
+				t := token{tokLeftBrace, "{", pos - 1}
+				seg = append(seg, t)
+				lastType = t.typ
 				continue
 			}
 			if ch == '}' {
@@ -168,7 +183,9 @@ func tokenize(src string) ([]token, error) {
 					break
 				}
 				advance()
-				seg = append(seg, token{tokRightBrace, "}", pos - 1})
+				t := token{tokRightBrace, "}", pos - 1}
+				seg = append(seg, t)
+				lastType = t.typ
 				continue
 			}
 			saved := pos
@@ -178,6 +195,7 @@ func tokenize(src string) ([]token, error) {
 			}
 			if t != nil {
 				seg = append(seg, *t)
+				lastType = t.typ
 			} else if pos == saved {
 				advance()
 			}
@@ -225,6 +243,44 @@ func tokenize(src string) ([]token, error) {
 	}
 	isAlNum := func(ch byte) bool { return isAlpha(ch) || isDigit(ch) }
 	isSpace := func(ch byte) bool { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' }
+	isRegexFlag := func(ch byte) bool { return ch == 'i' || ch == 'm' || ch == 's' || ch == 'g' || ch == 'u' }
+
+	readRegex := func(start int) (token, error) {
+		pattern := []byte{}
+		inClass := false
+		for pos < n {
+			ch := advance()
+			if ch == '\n' {
+				return token{}, fmt.Errorf("unterminated regex literal at position %d", start)
+			}
+			if ch == '\\' {
+				esc := advance()
+				pattern = append(pattern, '\\', esc)
+				continue
+			}
+			if ch == '[' {
+				inClass = true
+				pattern = append(pattern, ch)
+				continue
+			}
+			if ch == ']' {
+				inClass = false
+				pattern = append(pattern, ch)
+				continue
+			}
+			if ch == '/' && !inClass {
+				flags := []byte{}
+				for pos < n && isRegexFlag(peek(0)) {
+					flags = append(flags, advance())
+				}
+				val := string(pattern) + "/" + string(flags)
+				t := token{tokRegex, val, start}
+				return t, nil
+			}
+			pattern = append(pattern, ch)
+		}
+		return token{}, fmt.Errorf("unterminated regex literal at position %d", start)
+	}
 
 	nextToken = func() (*token, error) {
 		for pos < n && isSpace(peek(0)) {
@@ -357,6 +413,14 @@ func tokenize(src string) ([]token, error) {
 			return &t, nil
 		}
 
+		if ch == '/' && (lastType == -1 || regexAfterTokens[lastType]) {
+			advance()
+			t, err := readRegex(start)
+			if err != nil {
+				return nil, err
+			}
+			return &t, nil
+		}
 		advance()
 		var typ tokenType
 		switch ch {
@@ -420,6 +484,7 @@ func tokenize(src string) ([]token, error) {
 		}
 		if t != nil {
 			tokens = append(tokens, *t)
+			lastType = t.typ
 		}
 	}
 	tokens = append(tokens, token{tokEOF, "", pos})

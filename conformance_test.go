@@ -19,6 +19,7 @@ type conformanceTest struct {
 	Expected   interface{}            `yaml:"expected"`
 	Error      string                 `yaml:"error"`
 	Tags       []string               `yaml:"tags"`
+	Skip       bool                   `yaml:"skip"`
 }
 
 type conformanceSuite struct {
@@ -90,6 +91,9 @@ func TestConformance(t *testing.T) {
 			tc := tc
 			name := fmt.Sprintf("%s/%s", suite.Suite, tc.Name)
 			t.Run(name, func(t *testing.T) {
+				if tc.Skip {
+					t.Skip("marked skip in conformance suite")
+				}
 				ctx := map[string]any{}
 				for k, v := range tc.Context {
 					ctx[k] = v

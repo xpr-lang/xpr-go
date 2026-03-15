@@ -11,6 +11,93 @@ import (
 	"time"
 )
 
+type xprRegex struct {
+	pattern string
+	flags   string
+	re      *regexp.Regexp
+}
+
+func destructureInto(nameNode *node, val interface{}, vars map[string]interface{}, nxt func(*node) (interface{}, error)) error {
+	switch nameNode.typ {
+	case nodeIdentifier:
+		vars[nameNode.strVal] = val
+		return nil
+	case nodeObjectPattern:
+		if val == nil {
+			return fmt.Errorf("Cannot destructure null")
+		}
+		obj, _ := val.(map[string]interface{})
+		if obj == nil {
+			obj = map[string]interface{}{}
+		}
+		usedKeys := map[string]bool{}
+		for i, key := range nameNode.strSlice {
+			isRest := i < len(nameNode.boolSlice) && nameNode.boolSlice[i]
+			if isRest {
+				rest := map[string]interface{}{}
+				for k, v := range obj {
+					if !usedKeys[k] {
+						rest[k] = v
+					}
+				}
+				vars[key] = rest
+			} else {
+				usedKeys[key] = true
+				v, exists := obj[key]
+				if !exists {
+					v = nil
+				}
+				if v == nil && i < len(nameNode.defaultVals) && nameNode.defaultVals[i] != nil {
+					var err error
+					v, err = nxt(nameNode.defaultVals[i])
+					if err != nil {
+						return err
+					}
+				}
+				if err := destructureInto(nameNode.propVals[i], v, vars, nxt); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	case nodeArrayPattern:
+		if val == nil {
+			return fmt.Errorf("Cannot destructure null")
+		}
+		arr, ok := val.([]interface{})
+		if !ok {
+			return fmt.Errorf("Cannot destructure non-array as array")
+		}
+		for i, el := range nameNode.children {
+			isRest := i < len(nameNode.boolSlice) && nameNode.boolSlice[i]
+			if isRest {
+				if i < len(arr) {
+					vars[el.strVal] = append([]interface{}{}, arr[i:]...)
+				} else {
+					vars[el.strVal] = []interface{}{}
+				}
+				break
+			}
+			var v interface{}
+			if i < len(arr) {
+				v = arr[i]
+			}
+			if v == nil && i < len(nameNode.defaultVals) && nameNode.defaultVals[i] != nil {
+				var err error
+				v, err = nxt(nameNode.defaultVals[i])
+				if err != nil {
+					return err
+				}
+			}
+			if err := destructureInto(el, v, vars, nxt); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("unexpected pattern node type %d", nameNode.typ)
+}
+
 func expandArgs(argNodes []*node, nxt func(*node) (interface{}, error)) ([]interface{}, error) {
 	var result []interface{}
 	for _, a := range argNodes {
@@ -73,6 +160,8 @@ func xprType(v interface{}) string {
 		return "string"
 	case []interface{}:
 		return "array"
+	case *xprRegex:
+		return "regex"
 	case map[string]interface{}:
 		return "object"
 	}
@@ -136,6 +225,8 @@ func xprToString(v interface{}) string {
 		return formatNumber(val)
 	case string:
 		return val
+	case *xprRegex:
+		return "/" + val.pattern + "/" + val.flags
 	}
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -227,17 +318,20 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		return obj, nil
 
 	case nodeLetExpression:
-		val, err := nxt(n.children[0])
+		val, err := nxt(n.children[1])
 		if err != nil {
 			return nil, err
 		}
-		childVars := make(map[string]interface{}, len(ec.vars)+1)
+		childVars := make(map[string]interface{}, len(ec.vars)+4)
 		for k, v := range ec.vars {
 			childVars[k] = v
 		}
-		childVars[n.strVal] = val
 		childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
-		return evalNode(n.children[1], childEc)
+		innerNxt := func(e *node) (interface{}, error) { return evalNode(e, childEc) }
+		if err := destructureInto(n.children[0], val, childVars, innerNxt); err != nil {
+			return nil, err
+		}
+		return evalNode(n.children[2], childEc)
 
 	case nodeIdentifier:
 		name := n.strVal
@@ -325,6 +419,13 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		}
 		if op == "!=" {
 			return !xprEqual(left, right), nil
+		}
+
+		if _, ok := left.(*xprRegex); ok {
+			return nil, fmt.Errorf("type error: cannot use operator '%s' with regex", op)
+		}
+		if _, ok := right.(*xprRegex); ok {
+			return nil, fmt.Errorf("type error: cannot use operator '%s' with regex", op)
 		}
 
 		if op == "+" {
@@ -450,25 +551,49 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		return nxt(n.children[2])
 
 	case nodeArrowFunction:
-		params := n.strSlice
-		body := n.children[0]
 		capturedVars := make(map[string]interface{}, len(ec.vars))
 		for k, v := range ec.vars {
 			capturedVars[k] = v
 		}
+		usePatternParams := len(n.children) > 1 || (len(n.children) == 1 && (n.children[0].typ == nodeObjectPattern || n.children[0].typ == nodeArrayPattern))
+		if !usePatternParams {
+			params := n.strSlice
+			body := n.children[0]
+			fn := xprFunc(func(args ...interface{}) (interface{}, error) {
+				childVars := make(map[string]interface{}, len(capturedVars)+len(params))
+				for k, v := range capturedVars {
+					childVars[k] = v
+				}
+				for i, p := range params {
+					if i < len(args) {
+						childVars[p] = args[i]
+					} else {
+						childVars[p] = nil
+					}
+				}
+				childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
+				return evalNode(body, childEc)
+			})
+			return fn, nil
+		}
+		paramNodes := n.children[:len(n.children)-1]
+		body := n.children[len(n.children)-1]
 		fn := xprFunc(func(args ...interface{}) (interface{}, error) {
-			childVars := make(map[string]interface{}, len(capturedVars)+len(params))
+			childVars := make(map[string]interface{}, len(capturedVars)+len(paramNodes))
 			for k, v := range capturedVars {
 				childVars[k] = v
 			}
-			for i, p := range params {
+			childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
+			innerNxt := func(e *node) (interface{}, error) { return evalNode(e, childEc) }
+			for i, paramNode := range paramNodes {
+				var arg interface{}
 				if i < len(args) {
-					childVars[p] = args[i]
-				} else {
-					childVars[p] = nil
+					arg = args[i]
+				}
+				if err := destructureInto(paramNode, arg, childVars, innerNxt); err != nil {
+					return nil, err
 				}
 			}
-			childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
 			return evalNode(body, childEc)
 		})
 		return fn, nil
@@ -501,6 +626,9 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 			args, err := expandArgs(argNodes, nxt)
 			if err != nil {
 				return nil, err
+			}
+			if re, ok := obj.(*xprRegex); ok {
+				return callRegexMethod(re, methodName, args, n.position)
 			}
 			return dispatchMethod(obj, methodName, args, n.position)
 		}
@@ -599,6 +727,13 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 			return dispatchMethod(left, name, nil, n.position)
 		}
 
+		rhsVal, err := nxt(right)
+		if err != nil {
+			return nil, err
+		}
+		if fn, ok := rhsVal.(xprFunc); ok {
+			return fn(left)
+		}
 		return nil, fmt.Errorf("pipe RHS must be callable")
 
 	case nodeTemplateLiteral:
@@ -616,6 +751,28 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		}
 		return sb.String(), nil
 
+	case nodeRegexLiteral:
+		pattern := n.strVal
+		flags := ""
+		if len(n.strSlice) > 0 {
+			flags = n.strSlice[0]
+		}
+		prefix := ""
+		if strings.Contains(flags, "i") {
+			prefix += "(?i)"
+		}
+		if strings.Contains(flags, "m") {
+			prefix += "(?m)"
+		}
+		if strings.Contains(flags, "s") {
+			prefix += "(?s)"
+		}
+		re, err := regexp.Compile(prefix + pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern: %s", err)
+		}
+		return &xprRegex{pattern: pattern, flags: flags, re: re}, nil
+
 	case nodeSpreadElement:
 		return nil, fmt.Errorf("spread element used outside array context")
 	}
@@ -628,6 +785,14 @@ func xprEqual(a, b interface{}) bool {
 		return true
 	}
 	if a == nil || b == nil {
+		return false
+	}
+	ra, aIsRegex := a.(*xprRegex)
+	rb, bIsRegex := b.(*xprRegex)
+	if aIsRegex && bIsRegex {
+		return ra.pattern == rb.pattern && ra.flags == rb.flags
+	}
+	if aIsRegex || bIsRegex {
 		return false
 	}
 	_, aIsBool := a.(bool)
@@ -646,12 +811,30 @@ func xprEqual(a, b interface{}) bool {
 	return a == b
 }
 
+func callRegexMethod(re *xprRegex, method string, args []interface{}, pos int) (interface{}, error) {
+	switch method {
+	case "test":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'test': expected 1, got %d", len(args))
+		}
+		str, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("Type error: test expects string")
+		}
+		return re.re.MatchString(str), nil
+	default:
+		return nil, fmt.Errorf("type error: regex has no method '%s'", method)
+	}
+}
+
 func dispatchMethod(obj interface{}, method string, args []interface{}, pos int) (interface{}, error) {
 	switch v := obj.(type) {
 	case string:
 		return callStringMethod(v, method, args, pos)
 	case []interface{}:
 		return callArrayMethod(v, method, args, pos)
+	case *xprRegex:
+		return callRegexMethod(v, method, args, pos)
 	case map[string]interface{}:
 		return callObjectMethod(v, method, args, pos)
 	}
@@ -725,12 +908,45 @@ func callStringMethod(s, method string, args []interface{}, pos int) (interface{
 		if len(args) != 2 {
 			return nil, fmt.Errorf("wrong number of arguments for 'replace': expected 2, got %d", len(args))
 		}
-		old, ok1 := args[0].(string)
-		newStr, ok2 := args[1].(string)
-		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("type error: replace expects string arguments")
+		newStr, ok := args[1].(string)
+		if !ok {
+			return nil, fmt.Errorf("type error: replace replacement must be string")
+		}
+		if re, ok := args[0].(*xprRegex); ok {
+			prefix := ""
+			if strings.Contains(re.flags, "i") {
+				prefix += "(?i)"
+			}
+			if strings.Contains(re.flags, "m") {
+				prefix += "(?m)"
+			}
+			if strings.Contains(re.flags, "s") {
+				prefix += "(?s)"
+			}
+			compiled, err := regexp.Compile(prefix + re.pattern)
+			if err != nil {
+				return nil, fmt.Errorf("invalid regex: %s", err)
+			}
+			return compiled.ReplaceAllString(s, newStr), nil
+		}
+		old, ok2 := args[0].(string)
+		if !ok2 {
+			return nil, fmt.Errorf("type error: replace expects string or regex as first argument")
 		}
 		return strings.ReplaceAll(s, old, newStr), nil
+	case "match":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'match': expected 1, got %d", len(args))
+		}
+		re, ok := args[0].(*xprRegex)
+		if !ok {
+			return nil, fmt.Errorf("type error: match expects regex argument")
+		}
+		loc := re.re.FindStringIndex(s)
+		if loc == nil {
+			return nil, nil
+		}
+		return s[loc[0]:loc[1]], nil
 	case "slice":
 		if len(args) < 1 || len(args) > 2 {
 			return nil, fmt.Errorf("wrong number of arguments for 'slice': expected 1-2, got %d", len(args))

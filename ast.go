@@ -21,6 +21,9 @@ const (
 	nodePipeExpression
 	nodeSpreadElement
 	nodeLetExpression
+	nodeRegexLiteral
+	nodeObjectPattern
+	nodeArrayPattern
 )
 
 type node struct {
@@ -55,8 +58,17 @@ type node struct {
 	optional bool
 
 	// MemberExpression non-computed property name, ObjectExpression property keys
+	// ObjectPattern: property keys (parallel to propVals, boolSlice, defaultVals)
+	// RegexLiteral: strSlice[0] = flags
 	strSlice []string
 
 	// ObjectExpression property values (parallel to strSlice)
+	// ObjectPattern: binding targets (parallel to strSlice)
 	propVals []*node
+
+	// ObjectPattern/ArrayPattern: shorthand/rest flags (parallel to strSlice/children)
+	boolSlice []bool
+
+	// ObjectPattern/ArrayPattern: default value nodes (parallel to strSlice/children), nil if no default
+	defaultVals []*node
 }
