@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"regexp"
 	"sort"
 	"strconv"
@@ -338,6 +339,9 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		if v, ok := ec.vars[name]; ok {
 			return v, nil
 		}
+		if v, ok := globalConstants[name]; ok {
+			return v, nil
+		}
 		if fn, ok := globalFunctions[name]; ok {
 			return fn, nil
 		}
@@ -555,6 +559,7 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 		for k, v := range ec.vars {
 			capturedVars[k] = v
 		}
+		restParam := n.strVal
 		usePatternParams := len(n.children) > 1 || (len(n.children) == 1 && (n.children[0].typ == nodeObjectPattern || n.children[0].typ == nodeArrayPattern))
 		if !usePatternParams {
 			params := n.strSlice
@@ -570,6 +575,13 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 					} else {
 						childVars[p] = nil
 					}
+				}
+				if restParam != "" {
+					rest := make([]interface{}, 0)
+					if len(args) > len(params) {
+						rest = args[len(params):]
+					}
+					childVars[restParam] = rest
 				}
 				childEc := &evalCtx{vars: childVars, fns: ec.fns, depth: ec.depth + 1, startTime: ec.startTime}
 				return evalNode(body, childEc)
@@ -593,6 +605,13 @@ func evalNode(n *node, ec *evalCtx) (interface{}, error) {
 				if err := destructureInto(paramNode, arg, childVars, innerNxt); err != nil {
 					return nil, err
 				}
+			}
+			if restParam != "" {
+				rest := make([]interface{}, 0)
+				if len(args) > len(paramNodes) {
+					rest = args[len(paramNodes):]
+				}
+				childVars[restParam] = rest
 			}
 			return evalNode(body, childEc)
 		})
@@ -894,9 +913,17 @@ func callStringMethod(s, method string, args []interface{}, pos int) (interface{
 		if len(args) != 1 {
 			return nil, fmt.Errorf("wrong number of arguments for 'split': expected 1, got %d", len(args))
 		}
+		if re, ok := args[0].(*xprRegex); ok {
+			parts := re.re.Split(s, -1)
+			result := make([]interface{}, len(parts))
+			for i, p := range parts {
+				result[i] = p
+			}
+			return result, nil
+		}
 		sep, ok := args[0].(string)
 		if !ok {
-			return nil, fmt.Errorf("type error: split expects string argument")
+			return nil, fmt.Errorf("type error: split expects string or regex argument")
 		}
 		parts := strings.Split(s, sep)
 		result := make([]interface{}, len(parts))
@@ -1438,6 +1465,271 @@ func callArrayMethod(arr []interface{}, method string, args []interface{}, pos i
 			result[k] = groups[k]
 		}
 		return result, nil
+
+	case "sortBy":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'sortBy': expected 1 function, got %d", len(args))
+		}
+		fn, ok := args[0].(xprFunc)
+		if !ok {
+			return nil, fmt.Errorf("wrong number of arguments for 'sortBy': expected 1 function")
+		}
+		type indexedEl struct {
+			idx int
+			key interface{}
+			val interface{}
+		}
+		indexed := make([]indexedEl, len(arr))
+		allNumbers := true
+		allStrings := true
+		for i, el := range arr {
+			k, err := fn(el)
+			if err != nil {
+				return nil, err
+			}
+			if _, isNum := numVal(k); !isNum {
+				allNumbers = false
+			}
+			if _, isStr := k.(string); !isStr {
+				allStrings = false
+			}
+			indexed[i] = indexedEl{idx: i, key: k, val: el}
+		}
+		if len(arr) > 0 && !allNumbers && !allStrings {
+			return nil, fmt.Errorf("type error: sortBy key function must return all numbers or all strings")
+		}
+		sort.SliceStable(indexed, func(i, j int) bool {
+			if allNumbers {
+				a, _ := numVal(indexed[i].key)
+				b, _ := numVal(indexed[j].key)
+				return a < b
+			}
+			return indexed[i].key.(string) < indexed[j].key.(string)
+		})
+		out := make([]interface{}, len(arr))
+		for i, el := range indexed {
+			out[i] = el.val
+		}
+		return out, nil
+
+	case "take":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'take': expected 1, got %d", len(args))
+		}
+		nf, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: take expects integer argument")
+		}
+		n := int(nf)
+		if n <= 0 {
+			return []interface{}{}, nil
+		}
+		if n > len(arr) {
+			n = len(arr)
+		}
+		out := make([]interface{}, n)
+		copy(out, arr[:n])
+		return out, nil
+
+	case "drop":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'drop': expected 1, got %d", len(args))
+		}
+		nf, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: drop expects integer argument")
+		}
+		n := int(nf)
+		if n <= 0 {
+			out := make([]interface{}, len(arr))
+			copy(out, arr)
+			return out, nil
+		}
+		if n >= len(arr) {
+			return []interface{}{}, nil
+		}
+		out := make([]interface{}, len(arr)-n)
+		copy(out, arr[n:])
+		return out, nil
+
+	case "count":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'count': expected 1 function, got %d", len(args))
+		}
+		fn, ok := args[0].(xprFunc)
+		if !ok {
+			return nil, fmt.Errorf("wrong number of arguments for 'count': expected 1 function")
+		}
+		count := 0.0
+		for _, el := range arr {
+			v, err := fn(el)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(v) {
+				count++
+			}
+		}
+		return count, nil
+
+	case "sum":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'sum': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return 0.0, nil
+		}
+		total := 0.0
+		for _, el := range arr {
+			f, ok := numVal(el)
+			if !ok {
+				return nil, fmt.Errorf("type error: sum expects all elements to be numbers, got %s", xprType(el))
+			}
+			total += f
+		}
+		return total, nil
+
+	case "avg":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'avg': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return nil, fmt.Errorf("type error: cannot compute average of empty array")
+		}
+		total := 0.0
+		for _, el := range arr {
+			f, ok := numVal(el)
+			if !ok {
+				return nil, fmt.Errorf("type error: avg expects all elements to be numbers, got %s", xprType(el))
+			}
+			total += f
+		}
+		return total / float64(len(arr)), nil
+
+	case "compact":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'compact': expected 0, got %d", len(args))
+		}
+		out := []interface{}{}
+		for _, el := range arr {
+			if el != nil {
+				out = append(out, el)
+			}
+		}
+		return out, nil
+
+	case "partition":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'partition': expected 1 function, got %d", len(args))
+		}
+		fn, ok := args[0].(xprFunc)
+		if !ok {
+			return nil, fmt.Errorf("wrong number of arguments for 'partition': expected 1 function")
+		}
+		matches := []interface{}{}
+		nonMatches := []interface{}{}
+		for _, el := range arr {
+			v, err := fn(el)
+			if err != nil {
+				return nil, err
+			}
+			if isTruthy(v) {
+				matches = append(matches, el)
+			} else {
+				nonMatches = append(nonMatches, el)
+			}
+		}
+		return []interface{}{matches, nonMatches}, nil
+
+	case "keyBy":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'keyBy': expected 1 function, got %d", len(args))
+		}
+		fn, ok := args[0].(xprFunc)
+		if !ok {
+			return nil, fmt.Errorf("wrong number of arguments for 'keyBy': expected 1 function")
+		}
+		kbResult := map[string]interface{}{}
+		kbKeys := []string{}
+		for _, el := range arr {
+			keyVal, err := fn(el)
+			if err != nil {
+				return nil, err
+			}
+			key := fmt.Sprintf("%v", keyVal)
+			if _, exists := kbResult[key]; !exists {
+				kbKeys = append(kbKeys, key)
+			}
+			kbResult[key] = el
+		}
+		sort.Strings(kbKeys)
+		sorted := map[string]interface{}{}
+		for _, k := range kbKeys {
+			sorted[k] = kbResult[k]
+		}
+		return sorted, nil
+
+	case "min":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'min': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return nil, fmt.Errorf("type error: cannot compute min of empty array")
+		}
+		minVal, ok := numVal(arr[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: min expects all elements to be numbers, got %s", xprType(arr[0]))
+		}
+		for _, el := range arr[1:] {
+			f, ok := numVal(el)
+			if !ok {
+				return nil, fmt.Errorf("type error: min expects all elements to be numbers, got %s", xprType(el))
+			}
+			if f < minVal {
+				minVal = f
+			}
+		}
+		return minVal, nil
+
+	case "max":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'max': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return nil, fmt.Errorf("type error: cannot compute max of empty array")
+		}
+		maxVal, ok := numVal(arr[0])
+		if !ok {
+			return nil, fmt.Errorf("type error: max expects all elements to be numbers, got %s", xprType(arr[0]))
+		}
+		for _, el := range arr[1:] {
+			f, ok := numVal(el)
+			if !ok {
+				return nil, fmt.Errorf("type error: max expects all elements to be numbers, got %s", xprType(el))
+			}
+			if f > maxVal {
+				maxVal = f
+			}
+		}
+		return maxVal, nil
+
+	case "first":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'first': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return nil, nil
+		}
+		return arr[0], nil
+
+	case "last":
+		if len(args) != 0 {
+			return nil, fmt.Errorf("wrong number of arguments for 'last': expected 0, got %d", len(args))
+		}
+		if len(arr) == 0 {
+			return nil, nil
+		}
+		return arr[len(arr)-1], nil
 	}
 	return nil, fmt.Errorf("type error: cannot call method '%s' on array", method)
 }
@@ -1547,9 +1839,18 @@ func compileWithFlags(pattern string) (*regexp.Regexp, error) {
 	return regexp.Compile(prefix + src)
 }
 
+var globalConstants = map[string]interface{}{
+	"PI": math.Pi,
+	"E":  math.E,
+}
+
 var globalFunctionArity = map[string]int{
 	"round": 1, "floor": 1, "ceil": 1, "abs": 1,
 	"type": 1, "int": 1, "float": 1, "string": 1, "bool": 1,
+	"sqrt": 1, "log": 1, "sign": 1, "trunc": 1,
+	"isNumber": 1, "isString": 1, "isArray": 1, "isNull": 1, "isObject": 1, "isRegex": 1,
+	"fromEntries": 1,
+	"pow":         2, "random": 0,
 }
 
 var globalFunctions = map[string]xprFunc{
@@ -1985,5 +2286,164 @@ var globalFunctions = map[string]xprFunc{
 		}
 		goRepl := regexp.MustCompile(`\$(\d+)`).ReplaceAllString(replacement, "$${${1}}")
 		return re.ReplaceAllString(str, goRepl), nil
+	},
+
+	"sqrt": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'sqrt'")
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: sqrt expects number")
+		}
+		if f < 0 {
+			return nil, fmt.Errorf("Type error: cannot compute sqrt of negative number")
+		}
+		return math.Sqrt(f), nil
+	},
+	"log": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'log'")
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: log expects number")
+		}
+		if f <= 0 {
+			return nil, fmt.Errorf("Type error: cannot compute log of non-positive number")
+		}
+		return math.Log(f), nil
+	},
+	"pow": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("wrong number of arguments for 'pow': expected 2, got %d", len(args))
+		}
+		x, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: pow expects number")
+		}
+		y, ok := numVal(args[1])
+		if !ok {
+			return nil, fmt.Errorf("Type error: pow expects number")
+		}
+		return math.Pow(x, y), nil
+	},
+	"random": func(args ...interface{}) (interface{}, error) {
+		return rand.Float64(), nil
+	},
+	"sign": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'sign'")
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: sign expects number")
+		}
+		if f > 0 {
+			return 1.0, nil
+		}
+		if f < 0 {
+			return -1.0, nil
+		}
+		return 0.0, nil
+	},
+	"trunc": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'trunc'")
+		}
+		f, ok := numVal(args[0])
+		if !ok {
+			return nil, fmt.Errorf("Type error: trunc expects number")
+		}
+		return math.Trunc(f), nil
+	},
+
+	"isNumber": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isNumber'")
+		}
+		_, ok := numVal(args[0])
+		return ok, nil
+	},
+	"isString": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isString'")
+		}
+		_, ok := args[0].(string)
+		return ok, nil
+	},
+	"isArray": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isArray'")
+		}
+		_, ok := args[0].([]interface{})
+		return ok, nil
+	},
+	"isNull": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isNull'")
+		}
+		return args[0] == nil, nil
+	},
+	"isObject": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isObject'")
+		}
+		if _, isArr := args[0].([]interface{}); isArr {
+			return false, nil
+		}
+		if _, isRe := args[0].(*xprRegex); isRe {
+			return false, nil
+		}
+		if args[0] == nil {
+			return false, nil
+		}
+		_, ok := args[0].(map[string]interface{})
+		return ok, nil
+	},
+	"isRegex": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'isRegex'")
+		}
+		_, ok := args[0].(*xprRegex)
+		return ok, nil
+	},
+
+	"fromEntries": func(args ...interface{}) (interface{}, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("wrong number of arguments for 'fromEntries': expected 1, got %d", len(args))
+		}
+		pairs, ok := args[0].([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("Type error: fromEntries expects array")
+		}
+		result := map[string]interface{}{}
+		keys := []string{}
+		for _, pair := range pairs {
+			pairArr, ok := pair.([]interface{})
+			if !ok || len(pairArr) < 2 {
+				return nil, fmt.Errorf("Type error: fromEntries each element must be [key, value] pair")
+			}
+			var key string
+			if f, ok := numVal(pairArr[0]); ok {
+				if f == math.Trunc(f) {
+					key = strconv.FormatInt(int64(f), 10)
+				} else {
+					key = strconv.FormatFloat(f, 'f', -1, 64)
+				}
+			} else {
+				key = fmt.Sprintf("%v", pairArr[0])
+			}
+			if _, exists := result[key]; !exists {
+				keys = append(keys, key)
+			}
+			result[key] = pairArr[1]
+		}
+		sort.Strings(keys)
+		sorted := map[string]interface{}{}
+		for _, k := range keys {
+			sorted[k] = result[k]
+		}
+		return sorted, nil
 	},
 }

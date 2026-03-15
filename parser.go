@@ -249,12 +249,22 @@ func (p *parser) parseArrayPattern() (*node, error) {
 	return n, nil
 }
 
-func (p *parser) parseArrowParamList() ([]*node, error) {
+func (p *parser) parseArrowParamList() ([]*node, string, error) {
 	var params []*node
+	restParam := ""
 	for p.peek().typ != tokRightParen && p.peek().typ != tokEOF {
+		if p.peek().typ == tokDotDotDot {
+			p.advance()
+			restTok, err := p.expect(tokIdentifier)
+			if err != nil {
+				return nil, "", err
+			}
+			restParam = restTok.value
+			break
+		}
 		pn, err := p.parseBindingTarget()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		params = append(params, pn)
 		if p.peek().typ == tokComma {
@@ -263,7 +273,7 @@ func (p *parser) parseArrowParamList() ([]*node, error) {
 			break
 		}
 	}
-	return params, nil
+	return params, restParam, nil
 }
 
 func (p *parser) nud(t token) (*node, error) {
@@ -344,8 +354,9 @@ func (p *parser) nud(t token) (*node, error) {
 			}
 			return &node{typ: nodeArrowFunction, strSlice: []string{}, children: []*node{body}, position: pos}, nil
 		}
-		if p.peek().typ == tokLeftBrace || p.peek().typ == tokLeftBracket {
-			paramNodes, err := p.parseArrowParamList()
+		if p.peek().typ == tokDotDotDot {
+			p.advance()
+			restTok, err := p.expect(tokIdentifier)
 			if err != nil {
 				return nil, err
 			}
@@ -359,7 +370,24 @@ func (p *parser) nud(t token) (*node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &node{typ: nodeArrowFunction, children: append(paramNodes, body), position: pos}, nil
+			return &node{typ: nodeArrowFunction, strSlice: []string{}, strVal: restTok.value, children: []*node{body}, position: pos}, nil
+		}
+		if p.peek().typ == tokLeftBrace || p.peek().typ == tokLeftBracket {
+			paramNodes, restParam, err := p.parseArrowParamList()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokRightParen); err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tokArrow); err != nil {
+				return nil, err
+			}
+			body, err := p.expression(0)
+			if err != nil {
+				return nil, err
+			}
+			return &node{typ: nodeArrowFunction, strVal: restParam, children: append(paramNodes, body), position: pos}, nil
 		}
 		first, err := p.expression(0)
 		if err != nil {
@@ -370,9 +398,18 @@ func (p *parser) nud(t token) (*node, error) {
 				return nil, fmt.Errorf("arrow function params must be identifiers at position %d", pos)
 			}
 			paramNodes := []*node{first}
+			restParam := ""
 			for p.peek().typ == tokComma {
 				p.advance()
-				if p.peek().typ == tokLeftBrace {
+				if p.peek().typ == tokDotDotDot {
+					p.advance()
+					restTok, err := p.expect(tokIdentifier)
+					if err != nil {
+						return nil, err
+					}
+					restParam = restTok.value
+					break
+				} else if p.peek().typ == tokLeftBrace {
 					pn, err := p.parseObjectPattern()
 					if err != nil {
 						return nil, err
@@ -402,7 +439,7 @@ func (p *parser) nud(t token) (*node, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &node{typ: nodeArrowFunction, children: append(paramNodes, body), position: pos}, nil
+			return &node{typ: nodeArrowFunction, strVal: restParam, children: append(paramNodes, body), position: pos}, nil
 		}
 		if _, err := p.expect(tokRightParen); err != nil {
 			return nil, err
