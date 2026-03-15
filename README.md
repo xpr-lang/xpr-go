@@ -1,7 +1,8 @@
 # xpr-go — XPR Expression Language for Go
 
 [![CI](https://github.com/xpr-lang/xpr-go/actions/workflows/ci.yml/badge.svg)](https://github.com/xpr-lang/xpr-go/actions/workflows/ci.yml)
-[![XPR spec](https://img.shields.io/badge/XPR_spec-v0.2-blue)](https://github.com/xpr-lang/xpr)
+[![Go Reference](https://pkg.go.dev/badge/github.com/xpr-lang/xpr-go.svg)](https://pkg.go.dev/github.com/xpr-lang/xpr-go)
+[![XPR spec](https://img.shields.io/badge/XPR_spec-v0.5-blue)](https://github.com/xpr-lang/xpr)
 [![conformance](https://img.shields.io/badge/conformance-100%25-brightgreen)](https://github.com/xpr-lang/xpr/tree/main/conformance)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -106,6 +107,104 @@ result, _ := engine.Evaluate("[1, 2, ...[3, 4]]", nil) // → [1.0, 2.0, 3.0, 4.
 result, _ := engine.Evaluate("{...{a: 1}, b: 2}", nil) // → {a: 1.0, b: 2.0}
 ```
 
+## v0.3 Features
+
+### Date/Time
+
+Dates are epoch milliseconds (UTC only). Numbers return as `float64`.
+
+```go
+result, _ := engine.Evaluate(`formatDate(now(), "yyyy-MM-dd")`, nil)
+// → "2026-03-15"
+
+result, _ = engine.Evaluate(`dateDiff(parseDate("2024-01-01T00:00:00Z"), now(), "days")`, nil)
+// → float64(439)
+
+result, _ = engine.Evaluate(`dateAdd(parseDate("2024-01-31T00:00:00Z"), 1, "months")`, nil)
+// → float64(1709337600000)
+```
+
+### Regex
+
+Function-based regex (RE2 flavor).
+
+```go
+result, _ := engine.Evaluate(`matches("hello 42", "\\d+")`, nil)   // → true
+result, _ = engine.Evaluate(`match("order-123", "\\d+")`, nil)      // → "123"
+result, _ = engine.Evaluate(`matchAll("a1b2c3", "\\d")`, nil)       // → []any{"1","2","3"}
+result, _ = engine.Evaluate(`replacePattern("hello world","o","0")`, nil)  // → "hell0 w0rld"
+```
+
+### Negative Indexing and Spread in Calls
+
+```go
+result, _ := engine.Evaluate("[1,2,3][-1]", nil)         // → float64(3)
+result, _ = engine.Evaluate("max(...[1, 5, 3, 2])", nil) // → float64(5)
+```
+
+## v0.4 Features
+
+### Destructuring
+
+```go
+result, _ := engine.Evaluate("let {name, age} = user; name",
+    map[string]any{"user": map[string]any{"name": "Alice", "age": 30}})
+// → "Alice"
+
+result, _ = engine.Evaluate("let [head, ...tail] = items; tail",
+    map[string]any{"items": []any{1, 2, 3}})
+// → []any{float64(2), float64(3)}
+```
+
+### Regex Literals
+
+```go
+result, _ := engine.Evaluate(`/\d+/.test("order-123")`, nil)     // → true
+result, _ = engine.Evaluate(`"2024-01-15".match(/\d{4}/)`, nil)  // → "2024"
+result, _ = engine.Evaluate(`"hello world".replace(/o/, "0")`, nil)  // → "hell0 w0rld"
+```
+
+## v0.5 Features
+
+### Math
+
+```go
+result, _ := engine.Evaluate("sqrt(16)", nil)       // → float64(4)
+result, _ = engine.Evaluate("log(E)", nil)           // → float64(1)
+result, _ = engine.Evaluate("PI * pow(5, 2)", nil)   // → float64(78.539...)
+result, _ = engine.Evaluate("sign(-7)", nil)         // → float64(-1)
+result, _ = engine.Evaluate("trunc(3.9)", nil)       // → float64(3)
+```
+
+### Type Predicates
+
+```go
+result, _ := engine.Evaluate("isNumber(42)", nil)    // → true
+result, _ = engine.Evaluate("isString(\"x\")", nil)  // → true
+result, _ = engine.Evaluate("isObject([1,2])", nil)  // → false
+result, _ = engine.Evaluate("isNull(null)", nil)     // → true
+```
+
+### New Array Methods
+
+```go
+result, _ := engine.Evaluate("[3,null,1,null,5].compact().sortBy(x => x)", nil)
+// → []any{float64(1), float64(3), float64(5)}
+
+result, _ = engine.Evaluate("[1,2,3,4].sum()", nil)  // → float64(10)
+result, _ = engine.Evaluate("[1,2,3,4].avg()", nil)  // → float64(2.5)
+result, _ = engine.Evaluate("[3,1,2].first()", nil)  // → float64(3)
+```
+
+### Other
+
+```go
+result, _ := engine.Evaluate(`fromEntries([["a", 1], ["b", 2]])`, nil)
+// → map[string]any{"a": float64(1), "b": float64(2)}
+result, _ = engine.Evaluate(`"a1b2c3".split(/\d+/)`, nil)
+// → []any{"a", "b", "c"}
+```
+
 ## Conformance
 
 This runtime supports **Level 1–3** (all conformance levels):
@@ -114,6 +213,9 @@ This runtime supports **Level 1–3** (all conformance levels):
 - Level 3: Pipe operator (`|>`), optional chaining (`?.`), nullish coalescing (`??`)
 
 **v0.2 additions**: Let bindings, spread operator, 20 new built-in methods (10 array, 7 string, 2 object, 1 global)
+**v0.3 additions**: Date/time (12 fns), regex functions (4 fns), negative indexing, spread in calls
+**v0.4 additions**: Destructuring (let + arrow params), regex literals, `regex` type
+**v0.5 additions**: 6 math fns + PI/E, 6 type predicates, 13 new array methods, `fromEntries()`, rest params
 
 ## Specification
 
